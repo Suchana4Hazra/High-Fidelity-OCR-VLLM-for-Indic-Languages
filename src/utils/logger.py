@@ -1,6 +1,7 @@
 """Simple logger utilities used by the demo application."""
 import logging
 from typing import Optional
+from pathlib import Path
 
 
 def get_logger(name: str, level: str = "INFO") -> logging.Logger:
@@ -10,6 +11,8 @@ def get_logger(name: str, level: str = "INFO") -> logging.Logger:
         fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         handler.setFormatter(fmt)
         logger.addHandler(handler)
+    # Prevent duplicate logs when root logger also has handlers.
+    logger.propagate = False
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     return logger
 
@@ -24,6 +27,7 @@ def setup_logger(log_level: str = "INFO", log_file: Optional[str] = None) -> log
         stream.setFormatter(fmt)
         root.addHandler(stream)
         if log_file:
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
             fh = logging.FileHandler(log_file)
             fh.setFormatter(fmt)
             root.addHandler(fh)

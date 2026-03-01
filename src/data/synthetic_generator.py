@@ -5,7 +5,6 @@ import os
 import json
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
-import google.generativeai as genai
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from tqdm import tqdm
@@ -37,8 +36,13 @@ class SyntheticDataGenerator:
         self.domains = domains or ["legal", "medical", "general"]
         
         if self.api_key:
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel('gemini-pro')
+            try:
+                import google.generativeai as genai  # type: ignore
+                genai.configure(api_key=self.api_key)
+                self.model = genai.GenerativeModel("gemini-pro")
+            except Exception as e:
+                logger.warning(f"Gemini SDK unavailable, using mock data generation: {e}")
+                self.model = None
         else:
             logger.warning("No Gemini API key provided. Using mock data generation.")
             self.model = None

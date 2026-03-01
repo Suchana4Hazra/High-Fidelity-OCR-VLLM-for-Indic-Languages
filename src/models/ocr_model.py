@@ -2,6 +2,7 @@
 Simplified OCR model for demo purposes
 This is a mock implementation simulating the PaddleOCR-VL architecture
 """
+import os
 import cv2
 import numpy as np
 from typing import List, Dict, Tuple, Optional
@@ -31,25 +32,38 @@ class LayoutDetector:
         Returns:
             List of detected regions with bboxes
         """
-        # Simple mock implementation using contours
+        # Lightweight text block detection for printed/screenshot content.
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply thresholding
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-        
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+
+        # Connect characters into line-like components.
+        thresh = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            12,
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+        merged = cv2.dilate(thresh, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        img_h, img_w = image.shape[:2]
         regions = []
         for idx, contour in enumerate(contours):
             x, y, w, h = cv2.boundingRect(contour)
-            
-            # Filter small regions
-            if w < 20 or h < 10:
+
+            # Filter very small/noisy components.
+            if w < 30 or h < 12 or (w * h) < 450:
                 continue
-            
+
+            pad_x, pad_y = 3, 2
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(img_w, x + w + pad_x)
+            y2 = min(img_h, y + h + pad_y)
             regions.append({
-                'bbox': [x, y, x + w, y + h],
+                'bbox': [x1, y1, x2, y2],
                 'type': 'text',
                 'confidence': 0.95,
                 'reading_order': idx
@@ -66,18 +80,73 @@ class OCRRecognizer:
     
     def __init__(self, model_path: Optional[str] = None):
         self.model_path = model_path
+        self.use_hf = False
+        self.use_tesseract = False
         logger.info("Initialized OCR Recognizer")
+
+        # Try to use Hugging Face TrOCR first (best for handwriting)
+        hf_model_name = model_path or os.getenv("HF_OCR_MODEL", "microsoft/trocr-base-printed")
+        try:
+            import torch  # type: ignore
+            from transformers import TrOCRProcessor, VisionEncoderDecoderModel  # type: ignore
+
+            self._torch = torch
+            self._processor = TrOCRProcessor.from_pretrained(hf_model_name)
+            self._hf_model = VisionEncoderDecoderModel.from_pretrained(hf_model_name)
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._hf_model.to(self._device)
+            self._hf_model.eval()
+            self.use_hf = True
+            logger.info(f"Using Hugging Face OCR model: {hf_model_name} on {self._device}")
+            return
+        except Exception as e:
+            logger.warning(f"Hugging Face OCR unavailable, falling back to Tesseract/mock: {e}")
         
         # Try to use pytesseract if available
         try:
             import pytesseract  # type: ignore
+            tesseract_cmd = os.getenv("TESSERACT_CMD")
+            if tesseract_cmd and Path(tesseract_cmd).exists():
+                pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
             self.use_tesseract = True
             logger.info("Using Tesseract OCR for demo")
         except Exception:
             self.use_tesseract = False
             logger.warning("Tesseract not available, using mock OCR")
+
+    def _prepare_for_hf(self, image: np.ndarray) -> Image.Image:
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        if min(h, w) < 64:
+            rgb = cv2.resize(rgb, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+        elif min(h, w) < 128:
+            rgb = cv2.resize(rgb, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+        return Image.fromarray(rgb)
+
+    def _prepare_for_tesseract(self, image: np.ndarray) -> Image.Image:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bilateralFilter(gray, 7, 50, 50)
+        h, w = gray.shape[:2]
+        gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+        bw = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            35,
+            11,
+        )
+        return Image.fromarray(bw)
+
+    @staticmethod
+    def _low_quality_text(text: str) -> bool:
+        clean = (text or "").strip()
+        if len(clean) < 2:
+            return True
+        alnum = sum(1 for ch in clean if ch.isalnum())
+        return alnum == 0
     
-    def recognize(self, image_crop: np.ndarray, language: str = "eng+hin") -> Dict:
+    def recognize(self, image_crop: np.ndarray, language: str = "eng") -> Dict:
         """
         Recognize text in image crop
         
@@ -88,15 +157,30 @@ class OCRRecognizer:
         Returns:
             Recognition result with text and confidence
         """
+        if self.use_hf:
+            try:
+                pil_img = self._prepare_for_hf(image_crop)
+                pixel_values = self._processor(images=pil_img, return_tensors="pt").pixel_values.to(self._device)
+                with self._torch.no_grad():
+                    generated_ids = self._hf_model.generate(pixel_values, max_new_tokens=96)
+                text = self._processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+                if not self._low_quality_text(text):
+                    return {
+                        'text': text,
+                        'confidence': 0.90
+                    }
+            except Exception as e:
+                logger.error(f"Hugging Face OCR error: {e}")
+
         if self.use_tesseract:
             try:
                 import pytesseract
-                
-                # Convert to PIL Image
-                pil_img = Image.fromarray(cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB))
-                
-                # Perform OCR
-                text = pytesseract.image_to_string(pil_img, lang=language)
+                pil_img = self._prepare_for_tesseract(image_crop)
+                text = pytesseract.image_to_string(
+                    pil_img,
+                    lang=language,
+                    config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
+                )
                 confidence = 0.85
                 
                 return {
@@ -194,6 +278,14 @@ class PaddleOCRVL:
         
         # Stage 1: Layout Detection
         regions = self.layout_detector.detect(image)
+        if not regions:
+            h, w = image.shape[:2]
+            regions = [{
+                'bbox': [0, 0, w, h],
+                'type': 'text',
+                'confidence': 0.50,
+                'reading_order': 0
+            }]
         logger.info(f"Detected {len(regions)} text regions")
         
         # Stage 2: OCR Recognition
@@ -217,6 +309,16 @@ class PaddleOCRVL:
             }
             
             results.append(result)
+
+        if results and all(not (r["text"] or "").strip() for r in results):
+            h, w = image.shape[:2]
+            fallback = self.ocr_recognizer.recognize(image)
+            results = [{
+                'bbox': [0, 0, w, h],
+                'text': fallback['text'],
+                'confidence': fallback['confidence'],
+                'type': 'text'
+            }]
         
         # Stage 3: Optional Translation
         if translate_to:
