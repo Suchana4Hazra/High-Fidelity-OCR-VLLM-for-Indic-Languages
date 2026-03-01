@@ -1,0 +1,11 @@
+google-generativeai
+gradio
+numpy
+opencv-python
+Pillow
+tqdm
+pytesseract
+pdf2image
+torch
+transformers
+sentencepiece
